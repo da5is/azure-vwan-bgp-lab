@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "sshPublicKey": {
+      "value": "${SSH_PUBLIC_KEY}"
+    },
+    "vpnSharedKey": {
+      "value": "${VPN_SHARED_KEY}"
+    },
+    "sshSourcePrefix": {
+      "value": "${SSH_SOURCE_PREFIX=*}"
+    },
+    "adminUsername": {
+      "value": "${ADMIN_USERNAME=azureuser}"
+    },
+    "localAsn": {
+      "value": "${LOCAL_ASN=65001}"
+    }
+  }
+}

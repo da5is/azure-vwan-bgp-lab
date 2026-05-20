@@ -1,14 +1,14 @@
-# Automatic Linux S2S — VWAN BGP demo, fully automated
+# Automatic Linux S2S — VWAN BGP demo, fully automated (azd)
 
-End-to-end Bicep deployment that demonstrates **Azure Virtual WAN site-to-site VPN with BGP** using a Linux VM (strongSwan + FRR) as a simulated on-premises edge device. Includes a small test VM on each side that automatically validates Layer-3/4 connectivity over the tunnel.
+End-to-end Azure Developer CLI (`azd`) template that demonstrates **Azure Virtual WAN site-to-site VPN with BGP** using a Linux VM (strongSwan + FRR) as a simulated on-premises edge. Includes a small test VM on each side that automatically validates Layer-3/4 connectivity.
 
-No nested virtualization. No manual portal clicks. One `az deployment sub create` and you have working dual-tunnel IPsec + active/active BGP between two VNets.
+No nested virtualization. No portal clicks. `azd up` to deploy, `azd down` to destroy.
 
-## What it deploys
+## What gets deployed
 
 ```
                      ┌─────────────────────────────────────────────┐
-   Azure cloud       │  rg-lns2s-core                              │
+   Azure cloud       │  rg-<env>-core                              │
                      │  ┌──────────┐    ┌────────────────────────┐ │
                      │  │ vwan +   │    │  Azure spoke VNet      │ │
                      │  │ vhub +   │═══▶│  10.30.0.0/16          │ │
@@ -19,7 +19,7 @@ No nested virtualization. No manual portal clicks. One `az deployment sub create
                      └───────╫──────────┴────────────────────────┴─┘
               IPsec + BGP    ║   (dual tunnels, instance0/1)
                      ┌───────╫─────────────────────────────────────┐
-                     │  rg-lns2s-customer                          │
+                     │  rg-<env>-customer                          │
                      │  ┌────╨─────────┐    ┌────────────────────┐ │
                      │  │ Linux edge   │    │ customer test VM   │ │
                      │  │ VM (B2s)     │◀───│ 172.30.100.4       │ │
@@ -31,119 +31,153 @@ No nested virtualization. No manual portal clicks. One `az deployment sub create
                      └─────────────────────────────────────────────┘
 ```
 
-- **Hub side (`rg-lns2s-core`)**: VWAN, Virtual Hub (`10.254.254.0/24`), VPN Gateway (active/active, ASN 65515), Azure spoke VNet (`10.30.0.0/16`) with hub connection, Azure test VM.
-- **Customer side (`rg-lns2s-customer`)**: VNet (`172.30.0.0/16`) with edge subnet + workload subnet, Linux edge VM running strongSwan + FRR (ASN 65001), customer test VM, route table sending workload traffic via the edge.
-- **Test VMs (B1s Ubuntu)**: each runs an `iperf3` server, `nginx`, and a systemd timer that pings/curls/iperfs the peer every 2 minutes and writes the results to `/var/log/s2s-validation.log`.
+- **Hub side (`rg-<env>-core`)**: VWAN, Virtual Hub (`10.254.254.0/24`), VPN Gateway (active/active, ASN 65515), Azure spoke VNet (`10.30.0.0/16`) connected to the hub, an Azure test VM.
+- **Customer side (`rg-<env>-customer`)**: VNet (`172.30.0.0/16`) with edge subnet + workload subnet, Linux edge VM running strongSwan + FRR (ASN 65001), customer test VM, route table sending workload traffic via the edge.
+- **Test VMs (B1s Ubuntu)**: each runs `iperf3`, `nginx`, and a systemd timer that pings/curls/iperfs the peer every 2 minutes and writes to `/var/log/s2s-validation.log`.
 
 ## How it stays automatic
 
-The painful parts of a customer-edge VPN config are: discovering the Azure VPN Gateway tunnel public IPs, the BGP peer addresses, and the gateway ASN. Bicep exposes all of these as outputs of the `Microsoft.Network/vpnGateways` resource directly, so we render them into the edge VM's `cloud-init` **at deploy time** — no post-deploy script, no managed identity, no run-once hand-off.
-
-```
-vpnGateway.properties.bgpSettings.bgpPeeringAddresses[0|1].tunnelIpAddresses[0]
-vpnGateway.properties.bgpSettings.bgpPeeringAddresses[0|1].defaultBgpIpAddresses[0]
-vpnGateway.properties.bgpSettings.asn
-```
-
-These flow into `cloud-init/edge.yaml.tmpl` via Bicep `loadTextContent` + `replace()`, and the resulting cloud-init is base64-encoded into `customData` for the edge VM. On first boot, the VM:
+Bicep extracts the VPN gateway's BGP/tunnel addresses **as outputs** of the `Microsoft.Network/vpnGateways` resource (`bgpSettings.bgpPeeringAddresses[*].tunnelIpAddresses` / `defaultBgpIpAddresses`). Those flow into `infra/cloud-init/edge.yaml.tmpl` via `loadTextContent` + `replace()` and get base64-encoded into the edge VM's `customData`. On first boot the edge VM:
 
 1. Installs `strongswan`, `frr`, `iperf3`.
-2. Enables IP forwarding and relaxes `rp_filter` for VTI.
+2. Enables IP forwarding, relaxes `rp_filter` for VTI.
 3. Creates two VTI interfaces (`vti10`, `vti11`) with marks 100/200 — one per Azure gateway instance.
 4. Brings strongSwan up against both Azure tunnel public IPs.
 5. Starts FRR with two eBGP neighbors (one per VTI), advertising `172.30.0.0/16`.
 
 ## Prerequisites
 
-- Azure CLI logged in to the target subscription (`az login`).
+- [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd) (`azd version` >= 1.5).
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (used by post-provision validation hints).
 - An SSH public key (e.g. `~/.ssh/id_ed25519.pub`).
-- Bicep CLI (`az bicep install` if needed).
 
 ## Deploy
 
 ```powershell
-$env:LAB_SSH_PUBLIC_KEY = (Get-Content $HOME\.ssh\id_ed25519.pub -Raw).Trim()
-$env:LAB_VPN_PSK        = -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 32 | % {[char]$_})
+cd automatic-linux-s2s
 
-Copy-Item .\automatic-linux-s2s.bicepparam.sample .\automatic-linux-s2s.bicepparam
-# edit the file: set location + location_abbr (e.g. 'eastus2' / 'eus2')
+# One-time: create env, set required values
+azd env new lns2s-dev                               # any name
+azd env set SSH_PUBLIC_KEY "$((Get-Content $HOME\.ssh\id_ed25519.pub -Raw).Trim())"
+azd env set VPN_SHARED_KEY (-join ((48..57)+(65..90)+(97..122) | Get-Random -Count 32 | % {[char]$_}))
 
-az deployment sub create `
-  --location eastus2 `
-  --template-file .\automatic-linux-s2s.bicep `
-  --parameters .\automatic-linux-s2s.bicepparam
+# Optional overrides
+azd env set SSH_SOURCE_PREFIX "203.0.113.42/32"     # tighten SSH (default: *)
+azd env set ADMIN_USERNAME    "azureuser"
+azd env set LOCAL_ASN         "65001"
+
+# Provision (azd will prompt for region/subscription on first run)
+azd up
 ```
 
-Expect ~25–35 min total — VWAN VPN gateway provisioning is the long pole.
+Bash equivalent:
+
+```bash
+cd automatic-linux-s2s
+azd env new lns2s-dev
+azd env set SSH_PUBLIC_KEY "$(cat ~/.ssh/id_ed25519.pub)"
+azd env set VPN_SHARED_KEY "$(openssl rand -base64 32)"
+azd up
+```
+
+Expect ~25-35 min total — VWAN VPN gateway provisioning is the long pole. After provisioning, BGP needs another 1-3 minutes to converge before the test VMs start showing successful runs.
 
 ## Verify
 
-The deployment outputs include a one-shot validation command:
-
 ```powershell
-az deployment sub show -n <deployment-name> --query properties.outputs.validationCommand.value -o tsv
-```
-
-Or directly:
-
-```powershell
-# Read the validation log from the Azure-side test VM (no SSH key needed)
+# Tail the Azure-side test VM's validation log
 az vm run-command invoke `
-  -g rg-lns2s-core-eus2-001 `
-  -n vm-lns2s-aztest-eus2 `
+  -g (azd env get-value CORE_RESOURCE_GROUP) `
+  -n (azd env get-value AZURE_TEST_VM_NAME) `
   --command-id RunShellScript `
   --scripts "tail -n 80 /var/log/s2s-validation.log"
 ```
 
-You should see ping/HTTP/iperf3 succeeding to `172.30.100.4`. Run the same against the customer-side test VM (`vm-lns2s-custtest-*` in `rg-lns2s-customer-*`) for the reverse direction.
+You should see ping/HTTP/iperf3 succeeding to `172.30.100.4`. Run the same against `CUSTOMER_TEST_VM_NAME` in `CUSTOMER_RESOURCE_GROUP` for the reverse direction.
 
-To inspect tunnel/BGP state on the edge:
+Inspect strongSwan + FRR on the edge:
 
 ```powershell
 az vm run-command invoke `
-  -g rg-lns2s-customer-eus2-001 `
-  -n vm-lns2s-edge-eus2 `
+  -g (azd env get-value CUSTOMER_RESOURCE_GROUP) `
+  -n (azd env get-value EDGE_VM_NAME) `
   --command-id RunShellScript `
   --scripts "ipsec status; echo ---; vtysh -c 'show ip bgp summary'; echo ---; ip route | head -40"
 ```
 
-In the portal, the VWAN hub's **VPN (Site to site) → BGP Dashboard** should show two connected BGP peers learning `172.30.0.0/16`.
+In the portal: the VWAN hub's **VPN (Site to site) → BGP Dashboard** should show two connected BGP peers learning `172.30.0.0/16`.
+
+## Tear down
+
+```powershell
+azd down --purge --force
+```
+
+`azd down` finds all resources by their `azd-env-name` tag and deletes both resource groups in parallel.
 
 ## Cost
 
-Dominant cost is the VWAN VPN gateway scale unit (~$0.40/hr) + VWAN hub (~$0.25/hr). VMs (B1s × 2 + B2s × 1) are pennies. Tear down with:
+Dominant cost is the VWAN VPN gateway scale unit (~$0.40/hr) + VWAN hub (~$0.25/hr). VMs (B1s × 2 + B2s × 1) are pennies. Run `azd down` between sessions.
 
-```powershell
-az group delete -n rg-lns2s-core-eus2-001 --yes --no-wait
-az group delete -n rg-lns2s-customer-eus2-001 --yes --no-wait
-```
-
-## Files
+## File layout
 
 ```
 automatic-linux-s2s/
 ├── README.md
-├── automatic-linux-s2s.bicep            # subscription-scope entry
-├── automatic-linux-s2s.bicepparam.sample
-├── cloud-init/
-│   ├── edge.yaml.tmpl                   # strongSwan + FRR config
-│   └── testvm.yaml.tmpl                 # iperf3/nginx + validation timer
-└── modules/
-    ├── publicip.bicep
-    ├── virtualwan.bicep
-    ├── virtualhub.bicep
-    ├── vhubconnection.bicep
-    ├── vpngateway.bicep                 # exposes Azure BGP IPs as outputs
-    ├── vpnsite.bicep
-    ├── vpnsiteconnection.bicep
-    ├── routetable.bicep
-    ├── linuxedge.bicep                  # B2s edge VM (strongSwan + FRR)
-    └── testvm.bicep                     # B1s test VM
+├── azure.yaml                              # azd entry point
+└── infra/
+    ├── main.bicep                          # subscription-scope deployment
+    ├── main.parameters.json                # azd env var bindings
+    ├── cloud-init/
+    │   ├── edge.yaml.tmpl                  # strongSwan + FRR config
+    │   └── testvm.yaml.tmpl                # iperf3/nginx + validation timer
+    └── modules/
+        ├── publicip.bicep
+        ├── virtualwan.bicep
+        ├── virtualhub.bicep
+        ├── vhubconnection.bicep
+        ├── vpngateway.bicep                # exposes Azure BGP IPs as outputs
+        ├── vpnsite.bicep
+        ├── vpnsiteconnection.bicep
+        ├── routetable.bicep
+        ├── vnet.bicep
+        ├── linuxedge.bicep                 # B2s edge VM (strongSwan + FRR)
+        └── testvm.bicep                    # B1s test VM
 ```
+
+## azd env vars
+
+Required (set with `azd env set ...`):
+
+| Name | Description |
+| --- | --- |
+| `SSH_PUBLIC_KEY` | Single-line OpenSSH public key for all Linux VMs |
+| `VPN_SHARED_KEY` | IPsec PSK (any 16+ char string) |
+
+Optional:
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `SSH_SOURCE_PREFIX` | `*` | CIDR allowed to SSH to the edge VM |
+| `ADMIN_USERNAME` | `azureuser` | Linux admin user |
+| `LOCAL_ASN` | `65001` | Customer-side BGP ASN |
+
+Outputs surfaced in `.azure/<env>/.env`:
+
+| Name | Description |
+| --- | --- |
+| `AZURE_LOCATION` | Region |
+| `AZURE_RESOURCE_GROUP` / `CORE_RESOURCE_GROUP` | Hub-side RG |
+| `CUSTOMER_RESOURCE_GROUP` | Customer-side RG |
+| `EDGE_VM_NAME`, `EDGE_VM_PUBLIC_IP`, `EDGE_VM_PRIVATE_IP` | Edge appliance |
+| `AZURE_TEST_VM_NAME`, `AZURE_TEST_VM_IP` | Hub-side test VM |
+| `CUSTOMER_TEST_VM_NAME`, `CUSTOMER_TEST_VM_IP` | Customer-side test VM |
+| `AZURE_TUNNEL_IP_0/1`, `AZURE_BGP_IP_0/1` | VPN gateway BGP plane |
+| `VALIDATION_COMMAND` | Ready-to-run `az vm run-command` line |
 
 ## Notes / caveats
 
-- The edge VM has a public IP open on UDP/500, UDP/4500, and ESP from the Internet. That's required for VWAN to reach it — IKE source IPs are not fixed. SSH defaults to `*` for lab convenience; tighten `sshSourcePrefix` for anything real.
+- The edge VM has a public IP open on UDP/500, UDP/4500, and ESP from the Internet. Required for VWAN to reach it. SSH defaults to `*` for lab convenience; tighten `SSH_SOURCE_PREFIX` for anything real.
 - The PSK is interpolated into the VM's `customData`. ARM stores `customData` per VM; treat it as data, not a secret. For production-grade hygiene, replace with a Key Vault reference + an `az keyvault secret show` call from the VM's managed identity.
-- FRR is set to redistribute the static `172.30.0.0/16` network only. To advertise additional ranges, edit the `network` lines in `cloud-init/edge.yaml.tmpl` (or pass them as a parameter — easy extension).
-- IPsec proposals are `aes256-sha256-modp2048` for both phases. That matches Azure VPN's default IKEv2 policy and is meaningfully stronger than the `01-core-network` lab's `aes256-sha1-modp1024`.
+- IPsec proposals: `aes256-sha256-modp2048` for IKE and ESP. Matches Azure VPN's default IKEv2 policy.
+- FRR advertises only `172.30.0.0/16`. Edit `infra/cloud-init/edge.yaml.tmpl` to add more.

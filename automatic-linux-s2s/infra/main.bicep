@@ -1,18 +1,33 @@
 targetScope = 'subscription'
 
 // ============================================================================
-// Parameters
+// Parameters (azd injects environmentName + location)
 // ============================================================================
+@minLength(1)
+@maxLength(32)
+@description('azd environment name. Used to scope and tag all resources.')
+param environmentName string
+
+@minLength(1)
+@description('Azure region for the deployment.')
 param location string
-param location_abbr string
+
+@description('Optional extra tags merged onto every resource.')
 param tags object = {}
+
 param adminUsername string = 'azureuser'
-@description('SSH public key for Linux VMs (edge + test VMs). Required.')
+
+@description('SSH public key for all Linux VMs. Required.')
 param sshPublicKey string
+
 @secure()
+@description('Pre-shared key for the IPsec tunnels. Required.')
 param vpnSharedKey string
+
 @description('CIDR allowed to SSH to the edge VM. Default open; tighten for non-lab use.')
 param sshSourcePrefix string = '*'
+
+@description('BGP ASN for the simulated customer side. Must not equal Azure VWAN ASN (65515).')
 param localAsn int = 65001
 
 param deploymentTimestamp string = utcNow('yyyy-MM-dd HH:mm:ss')
@@ -20,45 +35,48 @@ param deploymentTimestamp string = utcNow('yyyy-MM-dd HH:mm:ss')
 // ============================================================================
 // Naming + address plan
 // ============================================================================
-var labPrefix = 'lns2s'
-var coreRgName = 'rg-${labPrefix}-core-${location_abbr}-001'
-var custRgName = 'rg-${labPrefix}-customer-${location_abbr}-001'
+var coreRgName = 'rg-${environmentName}-core'
+var custRgName = 'rg-${environmentName}-customer'
 
-var vwanName = 'vwan-${labPrefix}-${location_abbr}-001'
-var vhubName = 'vhub-${labPrefix}-${location_abbr}-001'
+var vwanName = 'vwan-${environmentName}'
+var vhubName = 'vhub-${environmentName}'
 var vhubAddressPrefix = '10.254.254.0/24'
-var vpnGatewayName = 'vpngw-${labPrefix}-${location_abbr}-001'
+var vpnGatewayName = 'vpngw-${environmentName}'
 
 // Azure-side workload VNet (spoke)
-var azVnetName = 'vnet-${labPrefix}-azure-${location_abbr}-001'
+var azVnetName = 'vnet-${environmentName}-azure'
 var azVnetCidr = '10.30.0.0/16'
 var azWorkloadSubnetName = 'snet-workload'
 var azWorkloadSubnetCidr = '10.30.100.0/24'
-var azTestVmName = 'vm-${labPrefix}-aztest-${location_abbr}'
+var azTestVmName = take('vm-${environmentName}-aztest', 64)
 var azTestVmIp = '10.30.100.4'
 var vhubConnectionName = 'vhubconn-${azVnetName}'
 
 // Customer-side simulated VNet
-var custVnetName = 'vnet-${labPrefix}-customer-${location_abbr}-001'
+var custVnetName = 'vnet-${environmentName}-customer'
 var custVnetCidr = '172.30.0.0/16'
 var custEdgeSubnetName = 'snet-edge'
 var custEdgeSubnetCidr = '172.30.0.0/24'
 var custWorkloadSubnetName = 'snet-workload'
 var custWorkloadSubnetCidr = '172.30.100.0/24'
-var edgeVmName = 'vm-${labPrefix}-edge-${location_abbr}'
+var edgeVmName = take('vm-${environmentName}-edge', 64)
 var edgeVmIp = '172.30.0.4'
-var custTestVmName = 'vm-${labPrefix}-custtest-${location_abbr}'
+var custTestVmName = take('vm-${environmentName}-custtest', 64)
 var custTestVmIp = '172.30.100.4'
-var custRouteTableName = 'rt-${labPrefix}-customer-workload'
+var custRouteTableName = 'rt-${environmentName}-customer-workload'
 
 // VPN site / VTI BGP plan
-var vpnSiteName = 'vpnsite-${labPrefix}-${location_abbr}-001'
-var vpnConnectionName = 'vpnconn-${labPrefix}-${location_abbr}-001'
+var vpnSiteName = 'vpnsite-${environmentName}'
+var vpnConnectionName = 'vpnconn-${environmentName}'
 var vti10Addr = '169.254.21.2'
 var vti11Addr = '169.254.21.6'
 var vpnSiteBgpAddress = vti10Addr
 
-var mergedTags = union(tags, { deployedAt: deploymentTimestamp, lab: 'automatic-linux-s2s' })
+var mergedTags = union(tags, {
+  'azd-env-name': environmentName
+  deployedAt: deploymentTimestamp
+  lab: 'automatic-linux-s2s'
+})
 
 // ============================================================================
 // Resource Groups
@@ -336,16 +354,21 @@ module custTestVm 'modules/testvm.bicep' = {
 }
 
 // ============================================================================
-// Outputs
+// Outputs (azd writes these to .azure/<env>/.env as AZURE_* env vars)
 // ============================================================================
-output coreResourceGroup string = coreRg.name
-output customerResourceGroup string = custRg.name
-output edgeVmPublicIp string = edgePip.outputs.publicIpAddress
-output edgeVmPrivateIp string = edgeVmIp
-output azureTestVmIp string = azTestVmIp
-output customerTestVmIp string = custTestVmIp
-output azureTunnelIp0 string = vpnGateway.outputs.azureTunnelIp0
-output azureTunnelIp1 string = vpnGateway.outputs.azureTunnelIp1
-output azureBgpIp0 string = vpnGateway.outputs.azureBgpIp0
-output azureBgpIp1 string = vpnGateway.outputs.azureBgpIp1
-output validationCommand string = 'az vm run-command invoke -g ${coreRg.name} -n ${azTestVmName} --command-id RunShellScript --scripts "tail -n 80 /var/log/s2s-validation.log"'
+output AZURE_LOCATION string = location
+output AZURE_RESOURCE_GROUP string = coreRg.name
+output CORE_RESOURCE_GROUP string = coreRg.name
+output CUSTOMER_RESOURCE_GROUP string = custRg.name
+output EDGE_VM_NAME string = edgeVmName
+output EDGE_VM_PUBLIC_IP string = edgePip.outputs.publicIpAddress
+output EDGE_VM_PRIVATE_IP string = edgeVmIp
+output AZURE_TEST_VM_NAME string = azTestVmName
+output AZURE_TEST_VM_IP string = azTestVmIp
+output CUSTOMER_TEST_VM_NAME string = custTestVmName
+output CUSTOMER_TEST_VM_IP string = custTestVmIp
+output AZURE_TUNNEL_IP_0 string = vpnGateway.outputs.azureTunnelIp0
+output AZURE_TUNNEL_IP_1 string = vpnGateway.outputs.azureTunnelIp1
+output AZURE_BGP_IP_0 string = vpnGateway.outputs.azureBgpIp0
+output AZURE_BGP_IP_1 string = vpnGateway.outputs.azureBgpIp1
+output VALIDATION_COMMAND string = 'az vm run-command invoke -g ${coreRg.name} -n ${azTestVmName} --command-id RunShellScript --scripts "tail -n 80 /var/log/s2s-validation.log"'

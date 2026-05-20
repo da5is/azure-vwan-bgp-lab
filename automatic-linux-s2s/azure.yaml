@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: automatic-linux-s2s
+metadata:
+  template: automatic-linux-s2s@1.0.0
+
+infra:
+  provider: bicep
+  path: infra
+  module: main
+
+hooks:
+  postprovision:
+    windows:
+      shell: pwsh
+      run: |
+        Write-Host ""
+        Write-Host "=== Validation ===" -ForegroundColor Cyan
+        Write-Host "VWAN VPN Gateway and BGP can take 2-5 minutes to converge after deploy."
+        Write-Host "Test VMs run validation every 2 minutes; tail their log with:"
+        Write-Host ""
+        Write-Host "  $env:VALIDATION_COMMAND" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Or check edge VM tunnel/BGP state:"
+        Write-Host "  az vm run-command invoke -g $env:CUSTOMER_RESOURCE_GROUP -n $env:EDGE_VM_NAME --command-id RunShellScript --scripts ""ipsec status; vtysh -c 'show ip bgp summary'"""
+    posix:
+      shell: sh
+      run: |
+        echo ""
+        echo "=== Validation ==="
+        echo "VWAN VPN Gateway and BGP can take 2-5 minutes to converge after deploy."
+        echo "Test VMs run validation every 2 minutes; tail their log with:"
+        echo ""
+        echo "  $VALIDATION_COMMAND"
+        echo ""
+        echo "Or check edge VM tunnel/BGP state:"
+        echo "  az vm run-command invoke -g $CUSTOMER_RESOURCE_GROUP -n $EDGE_VM_NAME --command-id RunShellScript --scripts \"ipsec status; vtysh -c 'show ip bgp summary'\""
