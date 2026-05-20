@@ -1,0 +1,19 @@
+using './automatic-linux-s2s.bicep'
+
+// Replace placeholders or supply via environment variables.
+param location = '<region>'                     // e.g. 'eastus2'
+param location_abbr = '<abbr>'                  // e.g. 'eus2'
+param tags = {}
+param adminUsername = 'azureuser'
+
+// SSH public key (single line) - REQUIRED. e.g. contents of ~/.ssh/id_ed25519.pub
+param sshPublicKey = readEnvironmentVariable('LAB_SSH_PUBLIC_KEY', '<ssh-public-key>')
+
+// Pre-shared key for IPsec - REQUIRED. Use a strong random string.
+param vpnSharedKey = readEnvironmentVariable('LAB_VPN_PSK', '<vpn-shared-key>')
+
+// Optional: tighten SSH source. Default '*' opens to Internet (lab only).
+param sshSourcePrefix = '*'
+
+// Customer-side BGP ASN. Must be 65000-65534 and not equal Azure's 65515.
+param localAsn = 65001

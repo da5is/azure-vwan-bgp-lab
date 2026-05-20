@@ -1,0 +1,80 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - iperf3
+  - nginx
+  - traceroute
+  - mtr-tiny
+  - curl
+  - jq
+
+write_files:
+  - path: /etc/systemd/system/iperf3-server.service
+    content: |
+      [Unit]
+      Description=iperf3 server
+      After=network.target
+      [Service]
+      ExecStart=/usr/bin/iperf3 -s -p 5201
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /var/www/html/index.html
+    content: |
+      <!doctype html><html><body>
+      <h1>__SIDE_NAME__ test VM</h1>
+      <p>If you can read this from the other side, S2S is working.</p>
+      </body></html>
+
+  - path: /usr/local/bin/s2s-validate.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      LOG=/var/log/s2s-validation.log
+      PEER=__PEER_IP__
+      LOCAL=__LOCAL_IP__
+      SIDE=__SIDE_NAME__
+      {
+        echo "==== $(date -u +%FT%TZ) S2S validation from $SIDE ($LOCAL) -> peer $PEER ===="
+        echo "--- routes to peer ---"
+        ip route get "$PEER" || true
+        echo "--- ping ---"
+        ping -c 4 -W 2 "$PEER" || true
+        echo "--- traceroute ---"
+        traceroute -n -w 2 -m 8 "$PEER" || true
+        echo "--- HTTP ---"
+        curl -sS --max-time 5 "http://$PEER/" || echo "HTTP FAIL"
+        echo
+        echo "--- iperf3 (10s) ---"
+        iperf3 -c "$PEER" -t 10 -p 5201 -J 2>&1 | jq -r '.end.sum_received | "throughput: \(.bits_per_second/1000000) Mbps, retransmits: \(.retransmits // "n/a")"' 2>/dev/null \
+          || iperf3 -c "$PEER" -t 10 -p 5201 || echo "IPERF FAIL"
+        echo "==== end ===="
+      } >> "$LOG" 2>&1
+
+  - path: /etc/systemd/system/s2s-validate.service
+    content: |
+      [Unit]
+      Description=S2S validation
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/s2s-validate.sh
+
+  - path: /etc/systemd/system/s2s-validate.timer
+    content: |
+      [Unit]
+      Description=Run S2S validation periodically
+      [Timer]
+      OnBootSec=90s
+      OnUnitActiveSec=2min
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now iperf3-server.service
+  - systemctl enable --now nginx
+  - systemctl enable --now s2s-validate.timer
