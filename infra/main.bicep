@@ -167,6 +167,13 @@ module vhubConnection 'modules/vhubconnection.bicep' = {
     vhubId: vhub.outputs.vhubId
     vnetId: azVnet.outputs.vnetId
   }
+  // The hub VNet connection and the VPN gateway both mutate the same virtual hub;
+  // VWAN serializes hub operations, so creating the connection while the gateway
+  // is still provisioning fails with a NotFound retry loop. Force the connection
+  // to wait for the gateway. (Bicep flags this as unnecessary — it is required.)
+  dependsOn: [
+    vpnGateway
+  ]
 }
 
 // ============================================================================
@@ -308,6 +315,13 @@ module vpnConnection 'modules/vpnsiteconnection.bicep' = {
     sharedKey: vpnSharedKey
     enableBgp: true
   }
+  // Serialize hub mutations: the site connection and the hub VNet connection both
+  // operate on the same virtual hub, which VWAN won't do concurrently. Chain this
+  // after vhubConnection (which itself waits on the VPN gateway) so all hub
+  // operations run gateway -> hub-conn -> vpn-conn. (Linter flags as unnecessary.)
+  dependsOn: [
+    vhubConnection
+  ]
 }
 
 // ============================================================================
