@@ -55,8 +55,6 @@ Bicep extracts the VPN gateway's BGP/tunnel addresses **as outputs** of the `Mic
 ## Deploy
 
 ```powershell
-cd automatic-linux-s2s
-
 # One-time: create env, set required values
 azd env new lns2s-dev                               # any name
 azd env set SSH_PUBLIC_KEY "$((Get-Content $HOME\.ssh\id_ed25519.pub -Raw).Trim())"
@@ -74,7 +72,6 @@ azd up
 Bash equivalent:
 
 ```bash
-cd automatic-linux-s2s
 azd env new lns2s-dev
 azd env set SSH_PUBLIC_KEY "$(cat ~/.ssh/id_ed25519.pub)"
 azd env set VPN_SHARED_KEY "$(openssl rand -base64 32)"
@@ -123,7 +120,7 @@ Dominant cost is the VWAN VPN gateway scale unit (~$0.40/hr) + VWAN hub (~$0.25/
 ## File layout
 
 ```
-automatic-linux-s2s/
+.
 ├── README.md
 ├── azure.yaml                              # azd entry point
 └── infra/

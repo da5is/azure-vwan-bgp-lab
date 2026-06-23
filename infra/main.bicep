@@ -80,7 +80,7 @@ var vpnSiteBgpAddress = vti10Addr
 var mergedTags = union(tags, {
   'azd-env-name': environmentName
   deployedAt: deploymentTimestamp
-  lab: 'automatic-linux-s2s'
+  lab: 'azure-vwan-bgp-lab'
 })
 
 // ============================================================================

@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
 
-name: automatic-linux-s2s
+name: azure-vwan-bgp-lab
 metadata:
-  template: automatic-linux-s2s@1.0.0
+  template: azure-vwan-bgp-lab@1.0.0
 
 infra:
   provider: bicep

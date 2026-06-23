@@ -208,7 +208,4 @@ __marimo__/
 
 # Project-specific ignores
 *.parameters.json
-*.bicepparam
-/9*/
-vyos-config-*.sh
 .github/copilot-instructions.md

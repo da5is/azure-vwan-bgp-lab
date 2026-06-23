@@ -1,9 +1,0 @@
-using './01-core-network.bicep'
-
-// Replace placeholder values or supply via environment variables
-param location = '<region>'
-param location_abbr = '<abbr>'
-param tags = {}
-param hvVmAdminUsername = '<admin-username>'
-param hvVmAdminPassword = readEnvironmentVariable('HV_VM_ADMIN_PASSWORD', '<admin-password>')
-param hvVpnSharedKey = readEnvironmentVariable('HV_VPN_SHARED_KEY', '<vpn-shared-key>')
