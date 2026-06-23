@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="660" viewBox="0 0 1000 660" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#5b6770"/>
+    </marker>
+    <style>
+      .title  { font-size: 22px; font-weight: 700; fill: #1b1f23; }
+      .zone    { font-size: 15px; font-weight: 700; }
+      .box     { font-size: 13px; font-weight: 700; fill: #1b1f23; }
+      .sub     { font-size: 12px; fill: #444c53; }
+      .cidr    { font-size: 12px; font-weight: 700; fill: #0b6bcb; }
+      .tunnel  { font-size: 12px; font-weight: 700; fill: #b5500a; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="660" fill="#ffffff"/>
+  <text x="500" y="38" text-anchor="middle" class="title">Azure VWAN — Site-to-Site IPsec VPN with BGP</text>
+
+  <!-- ===================== AZURE CLOUD ZONE ===================== -->
+  <rect x="30" y="60" width="940" height="250" rx="14" fill="#eaf3fc" stroke="#9cc4ec" stroke-width="2"/>
+  <text x="52" y="86" class="zone" fill="#0b6bcb">Microsoft Azure  —  rg-&lt;env&gt;-core</text>
+
+  <!-- VWAN hub + VPN gateway -->
+  <rect x="60" y="110" width="270" height="170" rx="10" fill="#ffffff" stroke="#0b6bcb" stroke-width="2"/>
+  <text x="76" y="134" class="box">Virtual WAN + Hub</text>
+  <text x="76" y="154" class="cidr">hub 10.254.254.0/24</text>
+  <line x1="76" y1="166" x2="314" y2="166" stroke="#dce6ef"/>
+  <text x="76" y="188" class="box">VPN Gateway</text>
+  <text x="76" y="206" class="sub">active / active (instance 0 + 1)</text>
+  <text x="76" y="226" class="sub">BGP ASN</text>
+  <text x="138" y="226" class="cidr" font-size="13">65515</text>
+  <text x="76" y="250" class="sub">BGP peers 10.254.254.12 / .13</text>
+  <text x="76" y="268" class="sub">+ 2 public IPs (IKE/ESP)</text>
+
+  <!-- Azure spoke VNet -->
+  <rect x="420" y="110" width="520" height="170" rx="10" fill="#f5fbff" stroke="#5b9bd5" stroke-width="2"/>
+  <text x="438" y="134" class="box">Azure spoke VNet</text>
+  <text x="438" y="153" class="cidr">10.30.0.0/16</text>
+
+  <rect x="600" y="160" width="320" height="95" rx="8" fill="#ffffff" stroke="#5b9bd5" stroke-width="1.5"/>
+  <text x="618" y="186" class="box">Azure test VM (B1s)</text>
+  <text x="618" y="206" class="cidr">10.30.100.4</text>
+  <text x="618" y="226" class="sub">nginx + iperf3 + validation timer</text>
+  <text x="618" y="244" class="sub">pings/curls peer every 2 min</text>
+
+  <!-- hub <-> spoke connection -->
+  <line x1="330" y1="150" x2="420" y2="150" stroke="#5b6770" stroke-width="2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <text x="375" y="142" text-anchor="middle" class="sub">hub conn</text>
+
+  <!-- ===================== ON-PREM / CUSTOMER ZONE ===================== -->
+  <rect x="30" y="390" width="940" height="240" rx="14" fill="#f0f1f3" stroke="#b9bfc6" stroke-width="2"/>
+  <text x="52" y="416" class="zone" fill="#5b6770">Simulated on-premises  —  rg-&lt;env&gt;-customer   ·   customer VNet 172.30.0.0/16</text>
+
+  <!-- edge subnet -->
+  <rect x="60" y="436" width="880" height="170" rx="10" fill="#ffffff" stroke="#8a929b" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="78" y="460" class="box">Edge subnet  172.30.0.0/24</text>
+  <text x="320" y="460" class="cidr">UDR: 10.30.0.0/16 → edge</text>
+
+  <!-- linux edge VM -->
+  <rect x="80" y="478" width="380" height="110" rx="8" fill="#fff7ef" stroke="#b5500a" stroke-width="2"/>
+  <text x="98" y="504" class="box">Linux edge VM (B2s)</text>
+  <text x="98" y="524" class="cidr">172.30.0.4</text>
+  <text x="98" y="544" class="sub">strongSwan (IPsec) + FRR (BGP)</text>
+  <text x="98" y="563" class="sub">ASN</text>
+  <text x="135" y="563" class="cidr" font-size="13">65001</text>
+  <text x="98" y="582" class="sub">2× VTI tunnels (vti10 / vti11)</text>
+
+  <!-- customer test VM -->
+  <rect x="500" y="478" width="420" height="110" rx="8" fill="#ffffff" stroke="#8a929b" stroke-width="1.5"/>
+  <text x="518" y="504" class="box">Customer test VM (B1s)</text>
+  <text x="518" y="524" class="cidr">172.30.0.5</text>
+  <text x="518" y="544" class="sub">nginx + iperf3 + validation timer</text>
+  <text x="518" y="563" class="sub">same subnet as edge → no SNAT needed</text>
+  <text x="518" y="582" class="sub">reaches Azure via the edge UDR</text>
+
+  <!-- ===================== TUNNELS ===================== -->
+  <line x1="170" y1="280" x2="200" y2="478" stroke="#b5500a" stroke-width="2.5"/>
+  <line x1="210" y1="280" x2="240" y2="478" stroke="#b5500a" stroke-width="2.5"/>
+  <rect x="300" y="338" width="400" height="50" rx="8" fill="#fff3e6" stroke="#b5500a" stroke-width="1.5"/>
+  <text x="500" y="358" text-anchor="middle" class="tunnel">IPsec IKEv2 + eBGP  —  dual VTI tunnels</text>
+  <text x="500" y="376" text-anchor="middle" class="sub">one per VPN-gateway instance · BGP advertises 172.30.0.0/16</text>
+</svg>
