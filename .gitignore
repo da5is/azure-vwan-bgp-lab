@@ -211,3 +211,4 @@ __marimo__/
 *.bicepparam
 /9*/
 vyos-config-*.sh
+.github/copilot-instructions.md

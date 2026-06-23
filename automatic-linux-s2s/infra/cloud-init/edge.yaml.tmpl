@@ -28,8 +28,8 @@ write_files:
         keyexchange=ikev2
         authby=psk
         type=tunnel
-        ike=aes256-sha256-modp2048!
-        esp=aes256-sha256-modp2048!
+        ike=aes256-sha256-modp2048,aes256-sha384-modp2048,aes256-sha256-modp1024,aes256-sha384-modp1024,aes256-sha1-modp1024,aes128-sha256-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024
+        esp=aes256-sha256,aes256-sha1,aes128-sha256,aes128-sha1,3des-sha1
         keyingtries=%forever
         auto=start
         closeaction=restart
@@ -56,6 +56,14 @@ write_files:
     content: |
       : PSK "__VPN_PSK__"
 
+  - path: /etc/strongswan.d/vti-no-routes.conf
+    content: |
+      charon {
+        # Route-based VTI tunnels: don't let charon install its own catch-all
+        # routes in table 220 (they would override the per-VTI routes).
+        install_routes = no
+      }
+
   - path: /usr/local/sbin/setup-vti.sh
     permissions: '0755'
     content: |
@@ -77,6 +85,12 @@ write_files:
       sysctl -w net.ipv4.conf.vti11.rp_filter=2
       ip route replace __AZ_BGP_IP_0__/32 dev vti10
       ip route replace __AZ_BGP_IP_1__/32 dev vti11
+      # Static /16 route so FRR originates __CUSTOMER_CIDR__ into BGP (the network
+      # statement needs a matching route) and the edge can forward to all customer
+      # subnets. No SNAT is needed: the customer test VM shares the edge's subnet, and
+      # Azure delivers NVA-forwarded foreign-source packets within the same subnet.
+      DEFAULT_GW=$(ip route show default | awk '{print $3; exit}')
+      [ -n "$DEFAULT_GW" ] && ip route replace __CUSTOMER_CIDR__ via "$DEFAULT_GW" dev eth0
 
   - path: /etc/systemd/system/vwan-vti.service
     content: |

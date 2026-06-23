@@ -62,8 +62,13 @@ var custWorkloadSubnetCidr = '172.30.100.0/24'
 var edgeVmName = take('vm-${environmentName}-edge', 64)
 var edgeVmIp = '172.30.0.4'
 var custTestVmName = take('vm-${environmentName}-custtest', 64)
-var custTestVmIp = '172.30.100.4'
-var custRouteTableName = 'rt-${environmentName}-customer-workload'
+// Customer test VM lives in the EDGE subnet (same subnet as the edge appliance).
+// Azure delivers NVA-forwarded packets with a non-VNet source only within the
+// same subnet, so co-locating the test VM with the edge avoids that limitation
+// without any SNAT. It also gets direct Internet (the edge subnet has no 0.0.0.0/0
+// UDR), so cloud-init package installs don't depend on the edge being ready.
+var custTestVmIp = '172.30.0.5'
+var custRouteTableName = 'rt-${environmentName}-customer-edge'
 
 // VPN site / VTI BGP plan
 var vpnSiteName = 'vpnsite-${environmentName}'
@@ -165,7 +170,8 @@ module vhubConnection 'modules/vhubconnection.bicep' = {
 }
 
 // ============================================================================
-// Customer-side route table (default route -> edge VM)
+// Customer-side route table: steer Azure-bound traffic from the edge subnet
+// (which hosts both the edge and the customer test VM) to the edge appliance.
 // ============================================================================
 module custRouteTable 'modules/routetable.bicep' = {
   scope: custRg
@@ -174,12 +180,14 @@ module custRouteTable 'modules/routetable.bicep' = {
     name: custRouteTableName
     location: location
     edgePrivateIp: edgeVmIp
+    routePrefix: azVnetCidr
     tags: mergedTags
   }
 }
 
 // ============================================================================
-// Customer-side VNet (edge subnet + workload subnet w/ UDR)
+// Customer-side VNet. The edge subnet carries the UDR to the Azure side and
+// hosts both the edge appliance and the customer test VM (same-subnet delivery).
 // ============================================================================
 module custVnet 'modules/vnet.bicep' = {
   scope: custRg
@@ -195,15 +203,15 @@ module custVnet 'modules/vnet.bicep' = {
         name: custEdgeSubnetName
         properties: {
           addressPrefix: custEdgeSubnetCidr
+          routeTable: {
+            id: custRouteTable.outputs.routeTableId
+          }
         }
       }
       {
         name: custWorkloadSubnetName
         properties: {
           addressPrefix: custWorkloadSubnetCidr
-          routeTable: {
-            id: custRouteTable.outputs.routeTableId
-          }
         }
       }
     ]
@@ -341,7 +349,7 @@ module custTestVm 'modules/testvm.bicep' = {
   params: {
     vmName: custTestVmName
     location: location
-    subnetId: '${custVnet.outputs.vnetId}/subnets/${custWorkloadSubnetName}'
+    subnetId: '${custVnet.outputs.vnetId}/subnets/${custEdgeSubnetName}'
     staticPrivateIp: custTestVmIp
     adminUsername: adminUsername
     sshPublicKey: sshPublicKey

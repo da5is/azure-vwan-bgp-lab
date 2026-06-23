@@ -22,17 +22,18 @@ No nested virtualization. No portal clicks. `azd up` to deploy, `azd down` to de
                      │  rg-<env>-customer                          │
                      │  ┌────╨─────────┐    ┌────────────────────┐ │
                      │  │ Linux edge   │    │ customer test VM   │ │
-                     │  │ VM (B2s)     │◀───│ 172.30.100.4       │ │
-                     │  │ strongSwan   │UDR │                    │ │
+                     │  │ VM (B2s)     │    │ 172.30.0.5         │ │
+                     │  │ strongSwan   │    │ (edge subnet)      │ │
                      │  │ + FRR (BGP)  │    └────────────────────┘ │
-                     │  │ 172.30.0.4   │                           │
+                     │  │ 172.30.0.4   │   UDR 10.30.0.0/16 →edge  │
                      │  └──────────────┘   customer VNet           │
+                     │   edge subnet 172.30.0.0/24                 │
                      │                      172.30.0.0/16          │
                      └─────────────────────────────────────────────┘
 ```
 
 - **Hub side (`rg-<env>-core`)**: VWAN, Virtual Hub (`10.254.254.0/24`), VPN Gateway (active/active, ASN 65515), Azure spoke VNet (`10.30.0.0/16`) connected to the hub, an Azure test VM.
-- **Customer side (`rg-<env>-customer`)**: VNet (`172.30.0.0/16`) with edge subnet + workload subnet, Linux edge VM running strongSwan + FRR (ASN 65001), customer test VM, route table sending workload traffic via the edge.
+- **Customer side (`rg-<env>-customer`)**: VNet (`172.30.0.0/16`), Linux edge VM running strongSwan + FRR (ASN 65001) and the customer test VM, **both in the edge subnet** (`172.30.0.0/24`). A UDR on that subnet steers `10.30.0.0/16` to the edge. Co-locating the test VM with the edge is deliberate: Azure delivers NVA-forwarded packets with a non-VNet source only within the same subnet, so this avoids any need for SNAT.
 - **Test VMs (B1s Ubuntu)**: each runs `iperf3`, `nginx`, and a systemd timer that pings/curls/iperfs the peer every 2 minutes and writes to `/var/log/s2s-validation.log`.
 
 ## How it stays automatic
@@ -93,7 +94,7 @@ az vm run-command invoke `
   --scripts "tail -n 80 /var/log/s2s-validation.log"
 ```
 
-You should see ping/HTTP/iperf3 succeeding to `172.30.100.4`. Run the same against `CUSTOMER_TEST_VM_NAME` in `CUSTOMER_RESOURCE_GROUP` for the reverse direction.
+You should see ping/HTTP/iperf3 succeeding to `172.30.0.5`. Run the same against `CUSTOMER_TEST_VM_NAME` in `CUSTOMER_RESOURCE_GROUP` for the reverse direction.
 
 Inspect strongSwan + FRR on the edge:
 
