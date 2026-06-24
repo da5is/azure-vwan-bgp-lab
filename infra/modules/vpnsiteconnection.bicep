@@ -20,7 +20,6 @@ resource vpnConnection 'Microsoft.Network/vpnGateways/vpnConnections@2023-11-01'
       id: vpnSiteId
     }
     vpnConnectionProtocolType: 'IKEv2'
-    ipsecPolicies: []
     vpnLinkConnections: [
       {
         name: '${connectionName}-link0'
@@ -32,6 +31,24 @@ resource vpnConnection 'Microsoft.Network/vpnGateways/vpnConnections@2023-11-01'
           enableBgp: enableBgp
           vpnConnectionProtocolType: 'IKEv2'
           connectionBandwidth: 100
+          // Pin strong, deterministic crypto instead of negotiating Azure's
+          // default policy (which settled on weak DH Group 2 / MODP_1024).
+          // Must match the edge ipsec.conf ike=/esp= lines exactly or the
+          // tunnels won't establish. Azure fixes the IKE (phase 1) SA lifetime
+          // at 28800s when a custom policy is used; only saLifeTimeSeconds
+          // (the IPsec/phase 2 lifetime) is configurable here.
+          ipsecPolicies: [
+            {
+              saLifeTimeSeconds: 27000
+              saDataSizeKilobytes: 102400000
+              ipsecEncryption: 'GCMAES256'
+              ipsecIntegrity: 'GCMAES256'
+              ikeEncryption: 'AES256'
+              ikeIntegrity: 'SHA256'
+              dhGroup: 'DHGroup14'
+              pfsGroup: 'None'
+            }
+          ]
         }
       }
     ]

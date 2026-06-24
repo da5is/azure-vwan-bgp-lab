@@ -23,13 +23,15 @@ write_files:
     content: |
       config setup
         charondebug="ike 1, knl 1, cfg 0"
-        uniqueids=no
+        uniqueids=replace
       conn %default
         keyexchange=ikev2
         authby=psk
         type=tunnel
-        ike=aes256-sha256-modp2048,aes256-sha384-modp2048,aes256-sha256-modp1024,aes256-sha384-modp1024,aes256-sha1-modp1024,aes128-sha256-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024
-        esp=aes256-sha256,aes256-sha1,aes128-sha256,aes128-sha1,3des-sha1
+        ike=aes256-sha256-modp2048!
+        esp=aes256gcm16!
+        ikelifetime=28800s
+        lifetime=27000s
         keyingtries=%forever
         auto=start
         closeaction=restart

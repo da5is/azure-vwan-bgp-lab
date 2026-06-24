@@ -1,0 +1,1901 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.44.1.10279",
+      "templateHash": "10641566521593917087"
+    }
+  },
+  "parameters": {
+    "environmentName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "metadata": {
+        "description": "azd environment name. Used to scope and tag all resources."
+      }
+    },
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "metadata": {
+        "description": "Azure region for the deployment."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Optional extra tags merged onto every resource."
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser"
+    },
+    "sshPublicKey": {
+      "type": "string",
+      "metadata": {
+        "description": "SSH public key for all Linux VMs. Required."
+      }
+    },
+    "vpnSharedKey": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Pre-shared key for the IPsec tunnels. Required."
+      }
+    },
+    "sshSourcePrefix": {
+      "type": "string",
+      "defaultValue": "*",
+      "metadata": {
+        "description": "CIDR allowed to SSH to the edge VM. Default open; tighten for non-lab use."
+      }
+    },
+    "localAsn": {
+      "type": "int",
+      "defaultValue": 65001,
+      "metadata": {
+        "description": "BGP ASN for the simulated customer side. Must not equal Azure VWAN ASN (65515)."
+      }
+    },
+    "deploymentTimestamp": {
+      "type": "string",
+      "defaultValue": "[utcNow('yyyy-MM-dd HH:mm:ss')]"
+    }
+  },
+  "variables": {
+    "$fxv#0": "#cloud-config\npackage_update: true\npackage_upgrade: false\npackages:\n  - strongswan\n  - frr\n  - frr-pythontools\n  - iperf3\n  - traceroute\n  - mtr-tiny\n  - tcpdump\n  - jq\n  - net-tools\n\nwrite_files:\n  - path: /etc/sysctl.d/99-vwan-edge.conf\n    content: |\n      net.ipv4.ip_forward=1\n      net.ipv4.conf.all.rp_filter=2\n      net.ipv4.conf.default.rp_filter=2\n\n  - path: /etc/ipsec.conf\n    content: |\n      config setup\n        charondebug=\"ike 1, knl 1, cfg 0\"\n        uniqueids=no\n      conn %default\n        keyexchange=ikev2\n        authby=psk\n        type=tunnel\n        ike=aes256-sha256-modp2048,aes256-sha384-modp2048,aes256-sha256-modp1024,aes256-sha384-modp1024,aes256-sha1-modp1024,aes128-sha256-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024\n        esp=aes256-sha256,aes256-sha1,aes128-sha256,aes128-sha1,3des-sha1\n        keyingtries=%forever\n        auto=start\n        closeaction=restart\n        dpdaction=restart\n        dpddelay=10s\n        dpdtimeout=30s\n        leftsubnet=0.0.0.0/0\n        rightsubnet=0.0.0.0/0\n      conn azure-0\n        left=%defaultroute\n        leftid=__EDGE_PUBLIC_IP__\n        right=__AZ_PUB_IP_0__\n        rightid=__AZ_PUB_IP_0__\n        mark=100\n      conn azure-1\n        left=%defaultroute\n        leftid=__EDGE_PUBLIC_IP__\n        right=__AZ_PUB_IP_1__\n        rightid=__AZ_PUB_IP_1__\n        mark=200\n\n  - path: /etc/ipsec.secrets\n    permissions: '0600'\n    content: |\n      : PSK \"__VPN_PSK__\"\n\n  - path: /etc/strongswan.d/vti-no-routes.conf\n    content: |\n      charon {\n        # Route-based VTI tunnels: don't let charon install its own catch-all\n        # routes in table 220 (they would override the per-VTI routes).\n        install_routes = no\n      }\n\n  - path: /usr/local/sbin/setup-vti.sh\n    permissions: '0755'\n    content: |\n      #!/bin/bash\n      set -euo pipefail\n      modprobe ip_vti || true\n      EDGE_PRIV_IP=$(ip -4 -o addr show eth0 | awk '{print $4}' | cut -d/ -f1)\n      ip link show vti10 >/dev/null 2>&1 || \\\n        ip link add vti10 type vti local \"$EDGE_PRIV_IP\" remote __AZ_PUB_IP_0__ key 100\n      ip link set vti10 up mtu 1400\n      ip -4 addr replace __VTI10_ADDR__/30 dev vti10\n      sysctl -w net.ipv4.conf.vti10.disable_policy=1\n      sysctl -w net.ipv4.conf.vti10.rp_filter=2\n      ip link show vti11 >/dev/null 2>&1 || \\\n        ip link add vti11 type vti local \"$EDGE_PRIV_IP\" remote __AZ_PUB_IP_1__ key 200\n      ip link set vti11 up mtu 1400\n      ip -4 addr replace __VTI11_ADDR__/30 dev vti11\n      sysctl -w net.ipv4.conf.vti11.disable_policy=1\n      sysctl -w net.ipv4.conf.vti11.rp_filter=2\n      ip route replace __AZ_BGP_IP_0__/32 dev vti10\n      ip route replace __AZ_BGP_IP_1__/32 dev vti11\n      # Static /16 route so FRR originates __CUSTOMER_CIDR__ into BGP (the network\n      # statement needs a matching route) and the edge can forward to all customer\n      # subnets. No SNAT is needed: the customer test VM shares the edge's subnet, and\n      # Azure delivers NVA-forwarded foreign-source packets within the same subnet.\n      DEFAULT_GW=$(ip route show default | awk '{print $3; exit}')\n      [ -n \"$DEFAULT_GW\" ] && ip route replace __CUSTOMER_CIDR__ via \"$DEFAULT_GW\" dev eth0\n\n  - path: /etc/systemd/system/vwan-vti.service\n    content: |\n      [Unit]\n      Description=VWAN VTI interfaces\n      After=network-online.target\n      Wants=network-online.target\n      Before=strongswan-starter.service strongswan.service frr.service\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/sbin/setup-vti.sh\n      RemainAfterExit=yes\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /etc/frr/daemons\n    content: |\n      bgpd=yes\n      ospfd=no\n      ospf6d=no\n      ripd=no\n      ripngd=no\n      isisd=no\n      pimd=no\n      ldpd=no\n      nhrpd=no\n      eigrpd=no\n      babeld=no\n      sharpd=no\n      pbrd=no\n      bfdd=no\n      fabricd=no\n      vtysh_enable=yes\n      zebra_options=\"  -A 127.0.0.1 -s 90000000\"\n      bgpd_options=\"   -A 127.0.0.1\"\n\n  - path: /etc/frr/frr.conf\n    permissions: '0640'\n    owner: frr:frr\n    content: |\n      frr defaults traditional\n      hostname linux-edge\n      log syslog informational\n      service integrated-vtysh-config\n      !\n      router bgp __LOCAL_ASN__\n       bgp router-id __VTI10_ADDR__\n       no bgp ebgp-requires-policy\n       neighbor __AZ_BGP_IP_0__ remote-as __AZ_ASN__\n       neighbor __AZ_BGP_IP_0__ ebgp-multihop 2\n       neighbor __AZ_BGP_IP_0__ update-source vti10\n       neighbor __AZ_BGP_IP_0__ timers 10 30\n       neighbor __AZ_BGP_IP_1__ remote-as __AZ_ASN__\n       neighbor __AZ_BGP_IP_1__ ebgp-multihop 2\n       neighbor __AZ_BGP_IP_1__ update-source vti11\n       neighbor __AZ_BGP_IP_1__ timers 10 30\n       !\n       address-family ipv4 unicast\n        network __CUSTOMER_CIDR__\n        neighbor __AZ_BGP_IP_0__ activate\n        neighbor __AZ_BGP_IP_0__ soft-reconfiguration inbound\n        neighbor __AZ_BGP_IP_1__ activate\n        neighbor __AZ_BGP_IP_1__ soft-reconfiguration inbound\n       exit-address-family\n      !\n      line vty\n      !\n\nruncmd:\n  - sysctl --system\n  - systemctl daemon-reload\n  - systemctl enable --now vwan-vti.service\n  - systemctl enable strongswan-starter 2>/dev/null || systemctl enable strongswan 2>/dev/null || true\n  - ipsec restart || true\n  - sleep 5\n  - systemctl enable --now frr\n  - systemctl restart frr\n  - ipsec status > /var/log/ipsec-bootstatus.log 2>&1 || true\n  - vtysh -c 'show ip bgp summary' > /var/log/bgp-bootstatus.log 2>&1 || true\n",
+    "$fxv#1": "#cloud-config\npackage_update: true\npackage_upgrade: false\npackages:\n  - iperf3\n  - nginx\n  - traceroute\n  - mtr-tiny\n  - curl\n  - jq\n\nwrite_files:\n  - path: /etc/systemd/system/iperf3-server.service\n    content: |\n      [Unit]\n      Description=iperf3 server\n      After=network.target\n      [Service]\n      ExecStart=/usr/bin/iperf3 -s -p 5201\n      Restart=always\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /var/www/html/index.html\n    content: |\n      <!doctype html><html><body>\n      <h1>__SIDE_NAME__ test VM</h1>\n      <p>If you can read this from the other side, S2S is working.</p>\n      </body></html>\n\n  - path: /usr/local/bin/s2s-validate.sh\n    permissions: '0755'\n    content: |\n      #!/bin/bash\n      LOG=/var/log/s2s-validation.log\n      PEER=__PEER_IP__\n      LOCAL=__LOCAL_IP__\n      SIDE=__SIDE_NAME__\n      {\n        echo \"==== $(date -u +%FT%TZ) S2S validation from $SIDE ($LOCAL) -> peer $PEER ====\"\n        echo \"--- routes to peer ---\"\n        ip route get \"$PEER\" || true\n        echo \"--- ping ---\"\n        ping -c 4 -W 2 \"$PEER\" || true\n        echo \"--- traceroute ---\"\n        traceroute -n -w 2 -m 8 \"$PEER\" || true\n        echo \"--- HTTP ---\"\n        curl -sS --max-time 5 \"http://$PEER/\" || echo \"HTTP FAIL\"\n        echo\n        echo \"--- iperf3 (10s) ---\"\n        iperf3 -c \"$PEER\" -t 10 -p 5201 -J 2>&1 | jq -r '.end.sum_received | \"throughput: \\(.bits_per_second/1000000) Mbps, retransmits: \\(.retransmits // \"n/a\")\"' 2>/dev/null \\\n          || iperf3 -c \"$PEER\" -t 10 -p 5201 || echo \"IPERF FAIL\"\n        echo \"==== end ====\"\n      } >> \"$LOG\" 2>&1\n\n  - path: /etc/systemd/system/s2s-validate.service\n    content: |\n      [Unit]\n      Description=S2S validation\n      After=network-online.target\n      Wants=network-online.target\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/bin/s2s-validate.sh\n\n  - path: /etc/systemd/system/s2s-validate.timer\n    content: |\n      [Unit]\n      Description=Run S2S validation periodically\n      [Timer]\n      OnBootSec=90s\n      OnUnitActiveSec=2min\n      [Install]\n      WantedBy=timers.target\n\nruncmd:\n  - systemctl daemon-reload\n  - systemctl enable --now iperf3-server.service\n  - systemctl enable --now nginx\n  - systemctl enable --now s2s-validate.timer\n",
+    "$fxv#2": "#cloud-config\npackage_update: true\npackage_upgrade: false\npackages:\n  - iperf3\n  - nginx\n  - traceroute\n  - mtr-tiny\n  - curl\n  - jq\n\nwrite_files:\n  - path: /etc/systemd/system/iperf3-server.service\n    content: |\n      [Unit]\n      Description=iperf3 server\n      After=network.target\n      [Service]\n      ExecStart=/usr/bin/iperf3 -s -p 5201\n      Restart=always\n      [Install]\n      WantedBy=multi-user.target\n\n  - path: /var/www/html/index.html\n    content: |\n      <!doctype html><html><body>\n      <h1>__SIDE_NAME__ test VM</h1>\n      <p>If you can read this from the other side, S2S is working.</p>\n      </body></html>\n\n  - path: /usr/local/bin/s2s-validate.sh\n    permissions: '0755'\n    content: |\n      #!/bin/bash\n      LOG=/var/log/s2s-validation.log\n      PEER=__PEER_IP__\n      LOCAL=__LOCAL_IP__\n      SIDE=__SIDE_NAME__\n      {\n        echo \"==== $(date -u +%FT%TZ) S2S validation from $SIDE ($LOCAL) -> peer $PEER ====\"\n        echo \"--- routes to peer ---\"\n        ip route get \"$PEER\" || true\n        echo \"--- ping ---\"\n        ping -c 4 -W 2 \"$PEER\" || true\n        echo \"--- traceroute ---\"\n        traceroute -n -w 2 -m 8 \"$PEER\" || true\n        echo \"--- HTTP ---\"\n        curl -sS --max-time 5 \"http://$PEER/\" || echo \"HTTP FAIL\"\n        echo\n        echo \"--- iperf3 (10s) ---\"\n        iperf3 -c \"$PEER\" -t 10 -p 5201 -J 2>&1 | jq -r '.end.sum_received | \"throughput: \\(.bits_per_second/1000000) Mbps, retransmits: \\(.retransmits // \"n/a\")\"' 2>/dev/null \\\n          || iperf3 -c \"$PEER\" -t 10 -p 5201 || echo \"IPERF FAIL\"\n        echo \"==== end ====\"\n      } >> \"$LOG\" 2>&1\n\n  - path: /etc/systemd/system/s2s-validate.service\n    content: |\n      [Unit]\n      Description=S2S validation\n      After=network-online.target\n      Wants=network-online.target\n      [Service]\n      Type=oneshot\n      ExecStart=/usr/local/bin/s2s-validate.sh\n\n  - path: /etc/systemd/system/s2s-validate.timer\n    content: |\n      [Unit]\n      Description=Run S2S validation periodically\n      [Timer]\n      OnBootSec=90s\n      OnUnitActiveSec=2min\n      [Install]\n      WantedBy=timers.target\n\nruncmd:\n  - systemctl daemon-reload\n  - systemctl enable --now iperf3-server.service\n  - systemctl enable --now nginx\n  - systemctl enable --now s2s-validate.timer\n",
+    "coreRgName": "[format('rg-{0}-core', parameters('environmentName'))]",
+    "custRgName": "[format('rg-{0}-customer', parameters('environmentName'))]",
+    "vwanName": "[format('vwan-{0}', parameters('environmentName'))]",
+    "vhubName": "[format('vhub-{0}', parameters('environmentName'))]",
+    "vhubAddressPrefix": "10.254.254.0/24",
+    "vpnGatewayName": "[format('vpngw-{0}', parameters('environmentName'))]",
+    "azVnetName": "[format('vnet-{0}-azure', parameters('environmentName'))]",
+    "azVnetCidr": "10.30.0.0/16",
+    "azWorkloadSubnetName": "snet-workload",
+    "azWorkloadSubnetCidr": "10.30.100.0/24",
+    "azTestVmName": "[take(format('vm-{0}-aztest', parameters('environmentName')), 64)]",
+    "azTestVmIp": "10.30.100.4",
+    "vhubConnectionName": "[format('vhubconn-{0}', variables('azVnetName'))]",
+    "custVnetName": "[format('vnet-{0}-customer', parameters('environmentName'))]",
+    "custVnetCidr": "172.30.0.0/16",
+    "custEdgeSubnetName": "snet-edge",
+    "custEdgeSubnetCidr": "172.30.0.0/24",
+    "custWorkloadSubnetName": "snet-workload",
+    "custWorkloadSubnetCidr": "172.30.100.0/24",
+    "edgeVmName": "[take(format('vm-{0}-edge', parameters('environmentName')), 64)]",
+    "edgeVmIp": "172.30.0.4",
+    "custTestVmName": "[take(format('vm-{0}-custtest', parameters('environmentName')), 64)]",
+    "custTestVmIp": "172.30.0.5",
+    "custRouteTableName": "[format('rt-{0}-customer-edge', parameters('environmentName'))]",
+    "vpnSiteName": "[format('vpnsite-{0}', parameters('environmentName'))]",
+    "vpnConnectionName": "[format('vpnconn-{0}', parameters('environmentName'))]",
+    "vti10Addr": "169.254.21.2",
+    "vti11Addr": "169.254.21.6",
+    "vpnSiteBgpAddress": "[variables('vti10Addr')]",
+    "mergedTags": "[union(parameters('tags'), createObject('azd-env-name', parameters('environmentName'), 'deployedAt', parameters('deploymentTimestamp'), 'lab', 'azure-vwan-bgp-lab'))]",
+    "azTestCloudInit": "[replace(replace(replace(variables('$fxv#1'), '__SIDE_NAME__', 'azure'), '__LOCAL_IP__', variables('azTestVmIp')), '__PEER_IP__', variables('custTestVmIp'))]",
+    "custTestCloudInit": "[replace(replace(replace(variables('$fxv#2'), '__SIDE_NAME__', 'customer'), '__LOCAL_IP__', variables('custTestVmIp')), '__PEER_IP__', variables('azTestVmIp'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2021-04-01",
+      "name": "[variables('coreRgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('mergedTags')]"
+    },
+    {
+      "type": "Microsoft.Resources/resourceGroups",
+      "apiVersion": "2021-04-01",
+      "name": "[variables('custRgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('mergedTags')]"
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vwan-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vwanName": {
+            "value": "[variables('vwanName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "10827790321843610897"
+            }
+          },
+          "parameters": {
+            "vwanName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualWans",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('vwanName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "type": "Standard",
+                "allowBranchToBranchTraffic": true,
+                "disableVpnEncryption": false
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vwanId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualWans', parameters('vwanName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vhub-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vhubName": {
+            "value": "[variables('vhubName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "vwanId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vwan-deploy'), '2025-04-01').outputs.vwanId.value]"
+          },
+          "addressPrefix": {
+            "value": "[variables('vhubAddressPrefix')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "13654419608494542195"
+            }
+          },
+          "parameters": {
+            "vhubName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "vwanId": {
+              "type": "string"
+            },
+            "addressPrefix": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualHubs",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('vhubName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "virtualWan": {
+                  "id": "[parameters('vwanId')]"
+                },
+                "addressPrefix": "[parameters('addressPrefix')]",
+                "sku": "Standard"
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vhubId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualHubs', parameters('vhubName'))]"
+            },
+            "vhubName": {
+              "type": "string",
+              "value": "[parameters('vhubName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vwan-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vpngw-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vpnGatewayName": {
+            "value": "[variables('vpnGatewayName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "vhubId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy'), '2025-04-01').outputs.vhubId.value]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "12255911373425472472"
+            }
+          },
+          "parameters": {
+            "vpnGatewayName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "vhubId": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/vpnGateways",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('vpnGatewayName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "virtualHub": {
+                  "id": "[parameters('vhubId')]"
+                },
+                "bgpSettings": {
+                  "asn": 65515
+                },
+                "vpnGatewayScaleUnit": 1
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vpnGatewayId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName'))]"
+            },
+            "vpnGatewayName": {
+              "type": "string",
+              "value": "[parameters('vpnGatewayName')]"
+            },
+            "azureAsn": {
+              "type": "int",
+              "value": "[reference(resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName')), '2023-11-01').bgpSettings.asn]"
+            },
+            "azureTunnelIp0": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName')), '2023-11-01').bgpSettings.bgpPeeringAddresses[0].tunnelIpAddresses[0]]"
+            },
+            "azureTunnelIp1": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName')), '2023-11-01').bgpSettings.bgpPeeringAddresses[1].tunnelIpAddresses[0]]"
+            },
+            "azureBgpIp0": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName')), '2023-11-01').bgpSettings.bgpPeeringAddresses[0].defaultBgpIpAddresses[0]]"
+            },
+            "azureBgpIp1": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/vpnGateways', parameters('vpnGatewayName')), '2023-11-01').bgpSettings.bgpPeeringAddresses[1].defaultBgpIpAddresses[0]]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "azvnet-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "name": {
+            "value": "[variables('azVnetName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "addressPrefixes": {
+            "value": [
+              "[variables('azVnetCidr')]"
+            ]
+          },
+          "subnets": {
+            "value": [
+              {
+                "name": "[variables('azWorkloadSubnetName')]",
+                "properties": {
+                  "addressPrefix": "[variables('azWorkloadSubnetCidr')]"
+                }
+              }
+            ]
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "13861727570146094393"
+            }
+          },
+          "parameters": {
+            "name": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "addressPrefixes": {
+              "type": "array"
+            },
+            "subnets": {
+              "type": "array"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('name')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": "[parameters('addressPrefixes')]"
+                },
+                "subnets": "[parameters('subnets')]"
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vnetId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualNetworks', parameters('name'))]"
+            },
+            "vnetName": {
+              "type": "string",
+              "value": "[parameters('name')]"
+            },
+            "subnetIds": {
+              "type": "array",
+              "copy": {
+                "count": "[length(parameters('subnets'))]",
+                "input": "[reference(resourceId('Microsoft.Network/virtualNetworks', parameters('name')), '2023-11-01').subnets[copyIndex()].id]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vhubconn-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "connectionName": {
+            "value": "[variables('vhubConnectionName')]"
+          },
+          "vhubName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy'), '2025-04-01').outputs.vhubName.value]"
+          },
+          "vhubId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy'), '2025-04-01').outputs.vhubId.value]"
+          },
+          "vnetId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'azvnet-deploy'), '2025-04-01').outputs.vnetId.value]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "2094132364569265589"
+            }
+          },
+          "parameters": {
+            "connectionName": {
+              "type": "string"
+            },
+            "vhubName": {
+              "type": "string"
+            },
+            "vhubId": {
+              "type": "string"
+            },
+            "vnetId": {
+              "type": "string"
+            },
+            "enableInternetSecurity": {
+              "type": "bool",
+              "defaultValue": false
+            },
+            "allowHubToRemoteVnetTransit": {
+              "type": "bool",
+              "defaultValue": true
+            },
+            "allowRemoteVnetToUseHubVnetGateways": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualHubs/hubVirtualNetworkConnections",
+              "apiVersion": "2023-11-01",
+              "name": "[format('{0}/{1}', parameters('vhubName'), parameters('connectionName'))]",
+              "properties": {
+                "remoteVirtualNetwork": {
+                  "id": "[parameters('vnetId')]"
+                },
+                "enableInternetSecurity": "[parameters('enableInternetSecurity')]",
+                "allowHubToRemoteVnetTransit": "[parameters('allowHubToRemoteVnetTransit')]",
+                "allowRemoteVnetToUseHubVnetGateways": "[parameters('allowRemoteVnetToUseHubVnetGateways')]",
+                "routingConfiguration": {
+                  "associatedRouteTable": {
+                    "id": "[format('{0}/hubRouteTables/defaultRouteTable', parameters('vhubId'))]"
+                  },
+                  "propagatedRouteTables": {
+                    "labels": [
+                      "default"
+                    ],
+                    "ids": [
+                      {
+                        "id": "[format('{0}/hubRouteTables/defaultRouteTable', parameters('vhubId'))]"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "connectionId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualHubs/hubVirtualNetworkConnections', parameters('vhubName'), parameters('connectionName'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'azvnet-deploy')]",
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "rt-deploy",
+      "resourceGroup": "[variables('custRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "name": {
+            "value": "[variables('custRouteTableName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "edgePrivateIp": {
+            "value": "[variables('edgeVmIp')]"
+          },
+          "routePrefix": {
+            "value": "[variables('azVnetCidr')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "6025997147746495947"
+            }
+          },
+          "parameters": {
+            "name": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "edgePrivateIp": {
+              "type": "string"
+            },
+            "routePrefix": {
+              "type": "string",
+              "defaultValue": "0.0.0.0/0"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/routeTables",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('name')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "disableBgpRoutePropagation": false,
+                "routes": [
+                  {
+                    "name": "to-azure-via-edge",
+                    "properties": {
+                      "addressPrefix": "[parameters('routePrefix')]",
+                      "nextHopType": "VirtualAppliance",
+                      "nextHopIpAddress": "[parameters('edgePrivateIp')]"
+                    }
+                  }
+                ]
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "routeTableId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/routeTables', parameters('name'))]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('custRgName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "custvnet-deploy",
+      "resourceGroup": "[variables('custRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "name": {
+            "value": "[variables('custVnetName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "addressPrefixes": {
+            "value": [
+              "[variables('custVnetCidr')]"
+            ]
+          },
+          "subnets": {
+            "value": [
+              {
+                "name": "[variables('custEdgeSubnetName')]",
+                "properties": {
+                  "addressPrefix": "[variables('custEdgeSubnetCidr')]",
+                  "routeTable": {
+                    "id": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'rt-deploy'), '2025-04-01').outputs.routeTableId.value]"
+                  }
+                }
+              },
+              {
+                "name": "[variables('custWorkloadSubnetName')]",
+                "properties": {
+                  "addressPrefix": "[variables('custWorkloadSubnetCidr')]"
+                }
+              }
+            ]
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "13861727570146094393"
+            }
+          },
+          "parameters": {
+            "name": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "addressPrefixes": {
+              "type": "array"
+            },
+            "subnets": {
+              "type": "array"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/virtualNetworks",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('name')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "addressSpace": {
+                  "addressPrefixes": "[parameters('addressPrefixes')]"
+                },
+                "subnets": "[parameters('subnets')]"
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vnetId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/virtualNetworks', parameters('name'))]"
+            },
+            "vnetName": {
+              "type": "string",
+              "value": "[parameters('name')]"
+            },
+            "subnetIds": {
+              "type": "array",
+              "copy": {
+                "count": "[length(parameters('subnets'))]",
+                "input": "[reference(resourceId('Microsoft.Network/virtualNetworks', parameters('name')), '2023-11-01').subnets[copyIndex()].id]"
+              }
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('custRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'rt-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "edge-pip-deploy",
+      "resourceGroup": "[variables('custRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "publicIpName": {
+            "value": "[format('{0}-pip', variables('edgeVmName'))]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "7726834281427466439"
+            }
+          },
+          "parameters": {
+            "publicIpName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/publicIPAddresses",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('publicIpName')]",
+              "location": "[parameters('location')]",
+              "sku": {
+                "name": "Standard"
+              },
+              "properties": {
+                "publicIPAllocationMethod": "Static",
+                "publicIPAddressVersion": "IPv4",
+                "idleTimeoutInMinutes": 4
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "publicIpId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/publicIPAddresses', parameters('publicIpName'))]"
+            },
+            "publicIpAddress": {
+              "type": "string",
+              "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', parameters('publicIpName')), '2023-11-01').ipAddress]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('custRgName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "edge-vm-deploy",
+      "resourceGroup": "[variables('custRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vmName": {
+            "value": "[variables('edgeVmName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "subnetId": {
+            "value": "[format('{0}/subnets/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'custvnet-deploy'), '2025-04-01').outputs.vnetId.value, variables('custEdgeSubnetName'))]"
+          },
+          "staticPrivateIp": {
+            "value": "[variables('edgeVmIp')]"
+          },
+          "adminUsername": {
+            "value": "[parameters('adminUsername')]"
+          },
+          "sshPublicKey": {
+            "value": "[parameters('sshPublicKey')]"
+          },
+          "customData": {
+            "value": "[replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(variables('$fxv#0'), '__EDGE_PUBLIC_IP__', '__EDGE_PUBLIC_IP_PLACEHOLDER__'), '__AZ_PUB_IP_0__', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureTunnelIp0.value), '__AZ_PUB_IP_1__', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureTunnelIp1.value), '__AZ_BGP_IP_0__', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureBgpIp0.value), '__AZ_BGP_IP_1__', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureBgpIp1.value), '__AZ_ASN__', string(reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureAsn.value)), '__VTI10_ADDR__', variables('vti10Addr')), '__VTI11_ADDR__', variables('vti11Addr')), '__LOCAL_ASN__', string(parameters('localAsn'))), '__CUSTOMER_CIDR__', variables('custVnetCidr')), '__EDGE_PUBLIC_IP_PLACEHOLDER__', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy'), '2025-04-01').outputs.publicIpAddress.value), '__VPN_PSK__', parameters('vpnSharedKey'))]"
+          },
+          "sshSourcePrefix": {
+            "value": "[parameters('sshSourcePrefix')]"
+          },
+          "existingPublicIpId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy'), '2025-04-01').outputs.publicIpId.value]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "13076479806320025623"
+            }
+          },
+          "parameters": {
+            "vmName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "subnetId": {
+              "type": "string"
+            },
+            "staticPrivateIp": {
+              "type": "string"
+            },
+            "adminUsername": {
+              "type": "string"
+            },
+            "sshPublicKey": {
+              "type": "securestring"
+            },
+            "customData": {
+              "type": "string"
+            },
+            "sshSourcePrefix": {
+              "type": "string",
+              "defaultValue": "*"
+            },
+            "existingPublicIpId": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "variables": {
+            "vmSize": "Standard_B2s",
+            "nicName": "[format('{0}-nic', parameters('vmName'))]",
+            "nsgName": "[format('{0}-nsg', parameters('vmName'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nsgName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "allow-ssh",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "Tcp",
+                      "sourceAddressPrefix": "[parameters('sshSourcePrefix')]",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "22"
+                    }
+                  },
+                  {
+                    "name": "allow-ipsec-ike",
+                    "properties": {
+                      "priority": 110,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "Udp",
+                      "sourceAddressPrefix": "Internet",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRanges": [
+                        "500",
+                        "4500"
+                      ]
+                    }
+                  },
+                  {
+                    "name": "allow-esp",
+                    "properties": {
+                      "priority": 120,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "Esp",
+                      "sourceAddressPrefix": "Internet",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  },
+                  {
+                    "name": "allow-vnet",
+                    "properties": {
+                      "priority": 200,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefix": "VirtualNetwork",
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "VirtualNetwork",
+                      "destinationPortRange": "*"
+                    }
+                  }
+                ]
+              },
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "type": "Microsoft.Network/networkInterfaces",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nicName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "enableIPForwarding": true,
+                "ipConfigurations": [
+                  {
+                    "name": "ipconfig1",
+                    "properties": {
+                      "subnet": {
+                        "id": "[parameters('subnetId')]"
+                      },
+                      "privateIPAllocationMethod": "Static",
+                      "privateIPAddress": "[parameters('staticPrivateIp')]",
+                      "publicIPAddress": {
+                        "id": "[parameters('existingPublicIpId')]"
+                      }
+                    }
+                  }
+                ],
+                "networkSecurityGroup": {
+                  "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Compute/virtualMachines",
+              "apiVersion": "2023-09-01",
+              "name": "[parameters('vmName')]",
+              "location": "[parameters('location')]",
+              "identity": {
+                "type": "SystemAssigned"
+              },
+              "properties": {
+                "hardwareProfile": {
+                  "vmSize": "[variables('vmSize')]"
+                },
+                "osProfile": {
+                  "computerName": "[parameters('vmName')]",
+                  "adminUsername": "[parameters('adminUsername')]",
+                  "customData": "[base64(parameters('customData'))]",
+                  "linuxConfiguration": {
+                    "disablePasswordAuthentication": true,
+                    "ssh": {
+                      "publicKeys": [
+                        {
+                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                          "keyData": "[parameters('sshPublicKey')]"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "storageProfile": {
+                  "imageReference": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "latest"
+                  },
+                  "osDisk": {
+                    "createOption": "FromImage",
+                    "diskSizeGB": 30,
+                    "managedDisk": {
+                      "storageAccountType": "Standard_LRS"
+                    }
+                  }
+                },
+                "networkProfile": {
+                  "networkInterfaces": [
+                    {
+                      "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+                    }
+                  ]
+                },
+                "diagnosticsProfile": {
+                  "bootDiagnostics": {
+                    "enabled": true
+                  }
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "vmId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+            },
+            "vmName": {
+              "type": "string",
+              "value": "[parameters('vmName')]"
+            },
+            "privateIpAddress": {
+              "type": "string",
+              "value": "[parameters('staticPrivateIp')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('custRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'custvnet-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vpnsite-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vpnSiteName": {
+            "value": "[variables('vpnSiteName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "vwanId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vwan-deploy'), '2025-04-01').outputs.vwanId.value]"
+          },
+          "publicIpAddress": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy'), '2025-04-01').outputs.publicIpAddress.value]"
+          },
+          "addressPrefixes": {
+            "value": [
+              "[variables('custVnetCidr')]"
+            ]
+          },
+          "bgpAsn": {
+            "value": "[parameters('localAsn')]"
+          },
+          "bgpPeeringAddress": {
+            "value": "[variables('vpnSiteBgpAddress')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "878827310474170833"
+            }
+          },
+          "parameters": {
+            "vpnSiteName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "vwanId": {
+              "type": "string"
+            },
+            "publicIpAddress": {
+              "type": "string"
+            },
+            "addressPrefixes": {
+              "type": "array"
+            },
+            "bgpAsn": {
+              "type": "int",
+              "defaultValue": 65001
+            },
+            "bgpPeeringAddress": {
+              "type": "string",
+              "defaultValue": "169.254.21.2"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/vpnSites",
+              "apiVersion": "2023-11-01",
+              "name": "[parameters('vpnSiteName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "virtualWan": {
+                  "id": "[parameters('vwanId')]"
+                },
+                "deviceProperties": {
+                  "deviceVendor": "Linux",
+                  "deviceModel": "strongSwan-FRR",
+                  "linkSpeedInMbps": 100
+                },
+                "addressSpace": {
+                  "addressPrefixes": "[parameters('addressPrefixes')]"
+                },
+                "vpnSiteLinks": [
+                  {
+                    "name": "[format('{0}-link0', parameters('vpnSiteName'))]",
+                    "properties": {
+                      "ipAddress": "[parameters('publicIpAddress')]",
+                      "linkProperties": {
+                        "linkProviderName": "Microsoft",
+                        "linkSpeedInMbps": 100
+                      },
+                      "bgpProperties": {
+                        "asn": "[parameters('bgpAsn')]",
+                        "bgpPeeringAddress": "[parameters('bgpPeeringAddress')]"
+                      }
+                    }
+                  }
+                ]
+              },
+              "tags": "[parameters('tags')]"
+            }
+          ],
+          "outputs": {
+            "vpnSiteId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/vpnSites', parameters('vpnSiteName'))]"
+            },
+            "vpnSiteName": {
+              "type": "string",
+              "value": "[parameters('vpnSiteName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vwan-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "vpnconn-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "connectionName": {
+            "value": "[variables('vpnConnectionName')]"
+          },
+          "vpnGatewayName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.vpnGatewayName.value]"
+          },
+          "vpnSiteId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpnsite-deploy'), '2025-04-01').outputs.vpnSiteId.value]"
+          },
+          "vpnSiteName": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpnsite-deploy'), '2025-04-01').outputs.vpnSiteName.value]"
+          },
+          "vhubId": {
+            "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy'), '2025-04-01').outputs.vhubId.value]"
+          },
+          "sharedKey": {
+            "value": "[parameters('vpnSharedKey')]"
+          },
+          "enableBgp": {
+            "value": true
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "12293682641188647360"
+            }
+          },
+          "parameters": {
+            "connectionName": {
+              "type": "string"
+            },
+            "vpnGatewayName": {
+              "type": "string"
+            },
+            "vpnSiteId": {
+              "type": "string"
+            },
+            "vpnSiteName": {
+              "type": "string"
+            },
+            "vhubId": {
+              "type": "string"
+            },
+            "sharedKey": {
+              "type": "securestring"
+            },
+            "enableBgp": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/vpnGateways/vpnConnections",
+              "apiVersion": "2023-11-01",
+              "name": "[format('{0}/{1}', parameters('vpnGatewayName'), parameters('connectionName'))]",
+              "properties": {
+                "remoteVpnSite": {
+                  "id": "[parameters('vpnSiteId')]"
+                },
+                "vpnConnectionProtocolType": "IKEv2",
+                "ipsecPolicies": [],
+                "vpnLinkConnections": [
+                  {
+                    "name": "[format('{0}-link0', parameters('connectionName'))]",
+                    "properties": {
+                      "vpnSiteLink": {
+                        "id": "[format('{0}/vpnSiteLinks/{1}-link0', parameters('vpnSiteId'), parameters('vpnSiteName'))]"
+                      },
+                      "sharedKey": "[parameters('sharedKey')]",
+                      "enableBgp": "[parameters('enableBgp')]",
+                      "vpnConnectionProtocolType": "IKEv2",
+                      "connectionBandwidth": 100
+                    }
+                  }
+                ],
+                "routingConfiguration": {
+                  "associatedRouteTable": {
+                    "id": "[format('{0}/hubRouteTables/defaultRouteTable', parameters('vhubId'))]"
+                  },
+                  "propagatedRouteTables": {
+                    "labels": [
+                      "default"
+                    ],
+                    "ids": [
+                      {
+                        "id": "[format('{0}/hubRouteTables/defaultRouteTable', parameters('vhubId'))]"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          "outputs": {
+            "connectionId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Network/vpnGateways/vpnConnections', parameters('vpnGatewayName'), parameters('connectionName'))]"
+            },
+            "connectionName": {
+              "type": "string",
+              "value": "[parameters('connectionName')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhub-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhubconn-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpnsite-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "aztestvm-deploy",
+      "resourceGroup": "[variables('coreRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vmName": {
+            "value": "[variables('azTestVmName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "subnetId": {
+            "value": "[format('{0}/subnets/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'azvnet-deploy'), '2025-04-01').outputs.vnetId.value, variables('azWorkloadSubnetName'))]"
+          },
+          "staticPrivateIp": {
+            "value": "[variables('azTestVmIp')]"
+          },
+          "adminUsername": {
+            "value": "[parameters('adminUsername')]"
+          },
+          "sshPublicKey": {
+            "value": "[parameters('sshPublicKey')]"
+          },
+          "customData": {
+            "value": "[variables('azTestCloudInit')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "431347793383120186"
+            }
+          },
+          "parameters": {
+            "vmName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "subnetId": {
+              "type": "string"
+            },
+            "staticPrivateIp": {
+              "type": "string"
+            },
+            "adminUsername": {
+              "type": "string"
+            },
+            "sshPublicKey": {
+              "type": "securestring"
+            },
+            "customData": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "variables": {
+            "vmSize": "Standard_B1s",
+            "nicName": "[format('{0}-nic', parameters('vmName'))]",
+            "nsgName": "[format('{0}-nsg', parameters('vmName'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nsgName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "allow-vnet-and-peer",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefixes": [
+                        "10.0.0.0/8",
+                        "172.16.0.0/12",
+                        "192.168.0.0/16"
+                      ],
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  }
+                ]
+              },
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "type": "Microsoft.Network/networkInterfaces",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nicName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "ipConfigurations": [
+                  {
+                    "name": "ipconfig1",
+                    "properties": {
+                      "subnet": {
+                        "id": "[parameters('subnetId')]"
+                      },
+                      "privateIPAllocationMethod": "Static",
+                      "privateIPAddress": "[parameters('staticPrivateIp')]"
+                    }
+                  }
+                ],
+                "networkSecurityGroup": {
+                  "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Compute/virtualMachines",
+              "apiVersion": "2023-09-01",
+              "name": "[parameters('vmName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "hardwareProfile": {
+                  "vmSize": "[variables('vmSize')]"
+                },
+                "osProfile": {
+                  "computerName": "[parameters('vmName')]",
+                  "adminUsername": "[parameters('adminUsername')]",
+                  "customData": "[base64(parameters('customData'))]",
+                  "linuxConfiguration": {
+                    "disablePasswordAuthentication": true,
+                    "ssh": {
+                      "publicKeys": [
+                        {
+                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                          "keyData": "[parameters('sshPublicKey')]"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "storageProfile": {
+                  "imageReference": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "latest"
+                  },
+                  "osDisk": {
+                    "createOption": "FromImage",
+                    "diskSizeGB": 30,
+                    "managedDisk": {
+                      "storageAccountType": "Standard_LRS"
+                    }
+                  }
+                },
+                "networkProfile": {
+                  "networkInterfaces": [
+                    {
+                      "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+                    }
+                  ]
+                },
+                "diagnosticsProfile": {
+                  "bootDiagnostics": {
+                    "enabled": true
+                  }
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "vmId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+            },
+            "vmName": {
+              "type": "string",
+              "value": "[parameters('vmName')]"
+            },
+            "privateIpAddress": {
+              "type": "string",
+              "value": "[parameters('staticPrivateIp')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'azvnet-deploy')]",
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('coreRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vhubconn-deploy')]"
+      ]
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "custtestvm-deploy",
+      "resourceGroup": "[variables('custRgName')]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "vmName": {
+            "value": "[variables('custTestVmName')]"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "subnetId": {
+            "value": "[format('{0}/subnets/{1}', reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'custvnet-deploy'), '2025-04-01').outputs.vnetId.value, variables('custEdgeSubnetName'))]"
+          },
+          "staticPrivateIp": {
+            "value": "[variables('custTestVmIp')]"
+          },
+          "adminUsername": {
+            "value": "[parameters('adminUsername')]"
+          },
+          "sshPublicKey": {
+            "value": "[parameters('sshPublicKey')]"
+          },
+          "customData": {
+            "value": "[variables('custTestCloudInit')]"
+          },
+          "tags": {
+            "value": "[variables('mergedTags')]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.44.1.10279",
+              "templateHash": "431347793383120186"
+            }
+          },
+          "parameters": {
+            "vmName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "subnetId": {
+              "type": "string"
+            },
+            "staticPrivateIp": {
+              "type": "string"
+            },
+            "adminUsername": {
+              "type": "string"
+            },
+            "sshPublicKey": {
+              "type": "securestring"
+            },
+            "customData": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "object",
+              "defaultValue": {}
+            }
+          },
+          "variables": {
+            "vmSize": "Standard_B1s",
+            "nicName": "[format('{0}-nic', parameters('vmName'))]",
+            "nsgName": "[format('{0}-nsg', parameters('vmName'))]"
+          },
+          "resources": [
+            {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nsgName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "allow-vnet-and-peer",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Allow",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourceAddressPrefixes": [
+                        "10.0.0.0/8",
+                        "172.16.0.0/12",
+                        "192.168.0.0/16"
+                      ],
+                      "sourcePortRange": "*",
+                      "destinationAddressPrefix": "*",
+                      "destinationPortRange": "*"
+                    }
+                  }
+                ]
+              },
+              "tags": "[parameters('tags')]"
+            },
+            {
+              "type": "Microsoft.Network/networkInterfaces",
+              "apiVersion": "2023-11-01",
+              "name": "[variables('nicName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "ipConfigurations": [
+                  {
+                    "name": "ipconfig1",
+                    "properties": {
+                      "subnet": {
+                        "id": "[parameters('subnetId')]"
+                      },
+                      "privateIPAllocationMethod": "Static",
+                      "privateIPAddress": "[parameters('staticPrivateIp')]"
+                    }
+                  }
+                ],
+                "networkSecurityGroup": {
+                  "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              ]
+            },
+            {
+              "type": "Microsoft.Compute/virtualMachines",
+              "apiVersion": "2023-09-01",
+              "name": "[parameters('vmName')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "hardwareProfile": {
+                  "vmSize": "[variables('vmSize')]"
+                },
+                "osProfile": {
+                  "computerName": "[parameters('vmName')]",
+                  "adminUsername": "[parameters('adminUsername')]",
+                  "customData": "[base64(parameters('customData'))]",
+                  "linuxConfiguration": {
+                    "disablePasswordAuthentication": true,
+                    "ssh": {
+                      "publicKeys": [
+                        {
+                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                          "keyData": "[parameters('sshPublicKey')]"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "storageProfile": {
+                  "imageReference": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "latest"
+                  },
+                  "osDisk": {
+                    "createOption": "FromImage",
+                    "diskSizeGB": 30,
+                    "managedDisk": {
+                      "storageAccountType": "Standard_LRS"
+                    }
+                  }
+                },
+                "networkProfile": {
+                  "networkInterfaces": [
+                    {
+                      "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+                    }
+                  ]
+                },
+                "diagnosticsProfile": {
+                  "bootDiagnostics": {
+                    "enabled": true
+                  }
+                }
+              },
+              "tags": "[parameters('tags')]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+              ]
+            }
+          ],
+          "outputs": {
+            "vmId": {
+              "type": "string",
+              "value": "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+            },
+            "vmName": {
+              "type": "string",
+              "value": "[parameters('vmName')]"
+            },
+            "privateIpAddress": {
+              "type": "string",
+              "value": "[parameters('staticPrivateIp')]"
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('custRgName'))]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'custvnet-deploy')]",
+        "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-vm-deploy')]"
+      ]
+    }
+  ],
+  "outputs": {
+    "AZURE_LOCATION": {
+      "type": "string",
+      "value": "[parameters('location')]"
+    },
+    "AZURE_RESOURCE_GROUP": {
+      "type": "string",
+      "value": "[variables('coreRgName')]"
+    },
+    "CORE_RESOURCE_GROUP": {
+      "type": "string",
+      "value": "[variables('coreRgName')]"
+    },
+    "CUSTOMER_RESOURCE_GROUP": {
+      "type": "string",
+      "value": "[variables('custRgName')]"
+    },
+    "EDGE_VM_NAME": {
+      "type": "string",
+      "value": "[variables('edgeVmName')]"
+    },
+    "EDGE_VM_PUBLIC_IP": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('custRgName')), 'Microsoft.Resources/deployments', 'edge-pip-deploy'), '2025-04-01').outputs.publicIpAddress.value]"
+    },
+    "EDGE_VM_PRIVATE_IP": {
+      "type": "string",
+      "value": "[variables('edgeVmIp')]"
+    },
+    "AZURE_TEST_VM_NAME": {
+      "type": "string",
+      "value": "[variables('azTestVmName')]"
+    },
+    "AZURE_TEST_VM_IP": {
+      "type": "string",
+      "value": "[variables('azTestVmIp')]"
+    },
+    "CUSTOMER_TEST_VM_NAME": {
+      "type": "string",
+      "value": "[variables('custTestVmName')]"
+    },
+    "CUSTOMER_TEST_VM_IP": {
+      "type": "string",
+      "value": "[variables('custTestVmIp')]"
+    },
+    "AZURE_TUNNEL_IP_0": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureTunnelIp0.value]"
+    },
+    "AZURE_TUNNEL_IP_1": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureTunnelIp1.value]"
+    },
+    "AZURE_BGP_IP_0": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureBgpIp0.value]"
+    },
+    "AZURE_BGP_IP_1": {
+      "type": "string",
+      "value": "[reference(extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, variables('coreRgName')), 'Microsoft.Resources/deployments', 'vpngw-deploy'), '2025-04-01').outputs.azureBgpIp1.value]"
+    },
+    "VALIDATION_COMMAND": {
+      "type": "string",
+      "value": "[format('az vm run-command invoke -g {0} -n {1} --command-id RunShellScript --scripts \"tail -n 80 /var/log/s2s-validation.log\"', variables('coreRgName'), variables('azTestVmName'))]"
+    }
+  }
+}
